@@ -1,150 +1,116 @@
-const express = require('express');
-const path = require('path');
-const http = require('http');
-const WebSocket = require('ws');
-const Database = require('better-sqlite3');  // NEW: works on Render
-const axios = require('axios');
-const cors = require('cors');
+import express from "express";
+import path from "path";
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
+import axios from "axios";
+import cors from "cors";
 
-// Load Discord webhook URL from Render environment variable
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
+// ---------- LOWDB (JSON DATABASE) ----------
+import { Low } from "lowdb";
+import { JSONFile } from "lowdb/node";
 
+const adapter = new JSONFile("weather.json");
+const db = new Low(adapter, { readings: [] });
+
+await db.read();
+db.data ||= { readings: [] };
+
+// ---------- EXPRESS SETUP ----------
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Serve frontend files from "public" folder (optional)
-app.use(express.static(path.join(__dirname, 'public')));
+// Serve static frontend (optional)
+app.use(express.static(path.join(process.cwd(), "public")));
 
-// ---------------------------------------
-// SQLite Setup (better-sqlite3 version)
-// ---------------------------------------
-const db = new Database('weather.db');
+// ---------- DISCORD WEBHOOK ----------
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS readings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    temperature REAL NOT NULL,
-    humidity REAL NOT NULL,
-    created_at TEXT NOT NULL
-  );
-`);
-
-// ---------------------------------------
-// HTTP + WebSocket setup
-// ---------------------------------------
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// Broadcast message to all WebSocket clients
-function broadcastJSON(obj) {
-  const msg = JSON.stringify(obj);
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(msg);
-    }
-  });
-}
-
-// ---------------------------------------
-// Discord Alert
-// ---------------------------------------
+// High temp alert
 async function sendDiscordNotification(temp, hum) {
   if (!DISCORD_WEBHOOK_URL) return;
   if (temp <= 30) return;
 
   const payload = {
     content: `🔥 **HIGH TEMPERATURE ALERT!**
-🌡️ Temperature: **${temp.toFixed(1)}°C**
+🌡️ Temp: **${temp.toFixed(1)}°C**
 💧 Humidity: **${hum.toFixed(1)}%**`
   };
 
   try {
     await axios.post(DISCORD_WEBHOOK_URL, payload);
   } catch (err) {
-    console.error("Discord webhook error:", err.message);
+    console.error("Discord error:", err.message);
   }
 }
 
-// ---------------------------------------
-// POST /api/readings  (from ESP32 or Wokwi)
-// ---------------------------------------
-app.post('/api/readings', (req, res) => {
-  const { temperature, humidity } = req.body;
+// ----------- WEBSOCKET SETUP -----------
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-  if (typeof temperature !== 'number' || typeof humidity !== 'number') {
-    return res.status(400).json({ error: 'temperature and humidity must be numbers' });
+function broadcastJSON(data) {
+  const msg = JSON.stringify(data);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+}
+
+wss.on("connection", (ws) => {
+  console.log("WebSocket client connected");
+
+  if (db.data.readings.length > 0) {
+    const latest = db.data.readings[db.data.readings.length - 1];
+    ws.send(JSON.stringify({ type: "latest-reading", data: latest }));
   }
 
-  const createdAt = new Date().toISOString();
+  ws.on("close", () => console.log("WebSocket disconnected"));
+});
 
-  const insert = db.prepare(`
-    INSERT INTO readings (temperature, humidity, created_at)
-    VALUES (?, ?, ?)
-  `);
+// ----------- POST /api/readings -----------
+app.post("/api/readings", async (req, res) => {
+  const { temperature, humidity } = req.body;
 
-  const result = insert.run(temperature, humidity, createdAt);
+  if (typeof temperature !== "number" || typeof humidity !== "number") {
+    return res.status(400).json({ error: "temperature and humidity must be numbers" });
+  }
+
+  const created_at = new Date().toISOString();
 
   const reading = {
-    id: result.lastInsertRowid,
+    id: db.data.readings.length + 1,
     temperature,
     humidity,
-    created_at: createdAt
+    created_at,
   };
 
-  broadcastJSON({ type: "new-reading", data: reading });
+  db.data.readings.push(reading);
+  await db.write();
 
+  broadcastJSON({ type: "new-reading", data: reading });
   sendDiscordNotification(temperature, humidity);
 
   res.status(201).json(reading);
 });
 
-// ---------------------------------------
-// GET /api/readings
-// ---------------------------------------
-app.get('/api/readings', (req, res) => {
+// ----------- GET /api/readings -----------
+app.get("/api/readings", (req, res) => {
   const limit = Number(req.query.limit) || 50;
-
-  const rows = db.prepare(`
-    SELECT * FROM readings ORDER BY created_at DESC LIMIT ?
-  `).all(limit);
-
+  const rows = db.data.readings.slice(-limit).reverse();
   res.json(rows);
 });
 
-// ---------------------------------------
-// GET /api/readings/latest
-// ---------------------------------------
-app.get('/api/readings/latest', (req, res) => {
-  const row = db.prepare(`
-    SELECT * FROM readings ORDER BY created_at DESC LIMIT 1
-  `).get();
-
-  if (!row) return res.status(404).json({ error: "No data yet" });
-  res.json(row);
-});
-
-// ---------------------------------------
-// WebSocket Handler
-// ---------------------------------------
-wss.on('connection', ws => {
-  console.log("WebSocket client connected");
-
-  const row = db.prepare(`
-    SELECT * FROM readings ORDER BY created_at DESC LIMIT 1
-  `).get();
-
-  if (row) {
-    ws.send(JSON.stringify({ type: "latest-reading", data: row }));
+// ----------- GET /api/readings/latest -----------
+app.get("/api/readings/latest", (req, res) => {
+  if (db.data.readings.length === 0) {
+    return res.status(404).json({ error: "No data yet" });
   }
 
-  ws.on('close', () => console.log("WebSocket disconnected"));
+  const latest = db.data.readings[db.data.readings.length - 1];
+  res.json(latest);
 });
 
-// ---------------------------------------
-// Start Server
-// ---------------------------------------
+// ----------- START SERVER -----------
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });

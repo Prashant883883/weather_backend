@@ -1,16 +1,15 @@
 {
   "name": "weather_backend",
   "version": "1.0.0",
-  "main": "server.js",
+  "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npm rebuild sqlite3 --build-from-source"
+    "start": "node server.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "better-sqlite3": "^12.5.0",
-    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "ws": "^8.14.2"
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "ws": "^8.14.2",
+    "lowdb": "^7.0.1"
   }
 }
